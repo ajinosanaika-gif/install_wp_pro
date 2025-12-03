@@ -36,6 +36,11 @@ if ! systemctl is-active --quiet mysql; then
     mkdir -p /var/run/mysqld
     chown mysql:mysql /var/run/mysqld
     systemctl restart mysql
+    # Ensure MySQL is running after restart
+    if ! systemctl is-active --quiet mysql; then
+        echo "MySQL gagal dijalankan. Silakan periksa log MySQL untuk detail kesalahan."
+        exit 1
+    fi
 fi
 
 # WP-CLI
@@ -117,7 +122,10 @@ EOL
 
 ln -sf $NGINX_CONF /etc/nginx/sites-enabled/$DOMAIN
 
+# TEST NGINX CONFIGURATION
 nginx -t || { echo "NGINX ERROR!"; exit 1; }
+
+# RELOAD NGINX
 systemctl reload nginx
 
 # SSL
