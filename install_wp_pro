@@ -21,24 +21,32 @@ DB_PASS=$(openssl rand -base64 16)
 
 echo "=== UPDATE SERVER & DEPENDENCIES ==="
 apt update -y
-apt install -y nginx mysql-server php php-fpm php-mysql php-xml php-gd php-curl php-zip php-mbstring unzip curl wget certbot python3-certbot-nginx ufw fail2ban jq
+DEBIAN_FRONTEND=noninteractive apt install -y nginx mysql-server php php-fpm php-mysql php-xml php-gd php-curl php-zip php-mbstring unzip curl wget certbot python3-certbot-nginx ufw fail2ban jq
 
 # DETECT PHP VERSION
 PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
 PHP_FPM_SERVICE="php$PHP_VER-fpm"
 
-# START SERVICES
-systemctl enable mysql nginx $PHP_FPM_SERVICE
-systemctl start mysql nginx $PHP_FPM_SERVICE
+# START & ENABLE SERVICES SAFELY
+for svc in mysql nginx $PHP_FPM_SERVICE; do
+    if systemctl list-unit-files | grep -q "^$svc"; then
+        systemctl enable $svc
+        systemctl start $svc
+    else
+        echo "Service $svc tidak ditemukan, lewati..."
+    fi
+done
 
 # FIX MYSQL IF NOT ACTIVE
 if ! systemctl is-active --quiet mysql; then
+    echo "MySQL belum aktif, coba restart..."
     mkdir -p /var/run/mysqld
     chown mysql:mysql /var/run/mysqld
     systemctl restart mysql
-    # Ensure MySQL is running after restart
+    sleep 5
     if ! systemctl is-active --quiet mysql; then
-        echo "MySQL gagal dijalankan. Silakan periksa log MySQL untuk detail kesalahan."
+        echo "MySQL gagal dijalankan. Periksa log dengan:"
+        echo "  sudo journalctl -xeu mysql.service"
         exit 1
     fi
 fi
@@ -51,8 +59,9 @@ mv wp-cli.phar /usr/local/bin/wp
 # DOWNLOAD WORDPRESS
 mkdir -p $ROOT_DIR
 wget -q https://wordpress.org/latest.zip -O /tmp/latest.zip
-unzip -oq /tmp/latest.zip -d $ROOT_DIR
-rm -rf /tmp/latest.zip
+unzip -oq /tmp/latest.zip -d /tmp/wordpress
+rsync -a /tmp/wordpress/ $ROOT_DIR/
+rm -rf /tmp/latest.zip /tmp/wordpress
 
 chown -R www-data:www-data $ROOT_DIR
 find $ROOT_DIR -type d -exec chmod 755 {} \;
