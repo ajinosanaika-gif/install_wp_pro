@@ -1,166 +1,183 @@
 #!/bin/bash
 
-############################################
-# WORDPRESS PRO ULTIMATE AUTO-INSTALL
-# WP + FASTCGI + RANKMATH + AUTO PURGE + CLOUDFLARE
-############################################
+# ================================================
+# WordPress Auto-Install Script (Nginx, PHP 8.3, MariaDB, Rank Math, SEO)
+# ================================================
 
-# INPUT
+# Mengambil Input dari Pengguna
 read -p "Masukkan nama domain (contoh: example.com): " DOMAIN
-read -s -p "Masukkan password root MySQL: " DB_ROOT_PASS
+read -p "Masukkan nama database: " DB_NAME
+read -p "Masukkan username MySQL: " DB_USER
+read -s -p "Masukkan password MySQL: " DB_PASS
 echo
-read -p "Apakah mau setup Cloudflare auto-purge cache? (y/n): " USE_CF
-if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
-    read -p "Masukkan Cloudflare API Token: " CF_API_TOKEN
-    read -p "Masukkan Cloudflare Zone ID: " CF_ZONE_ID
-fi
 
-ROOT_DIR="/var/www/$DOMAIN"
-DB_USER=$(echo $DOMAIN | sed 's/[^a-zA-Z0-9]//g')
-DB_PASS=$(openssl rand -base64 16)
+# Direktori Root untuk WordPress
+ROOT_DIR="/var/www/$DOMAIN/wordpress"
+SSL_DIR="/etc/ssl/$DOMAIN"
 
-echo "=== UPDATE SERVER & DEPENDENCIES ==="
-apt update -y
-DEBIAN_FRONTEND=noninteractive apt install -y nginx mysql-server php php-fpm php-mysql php-xml php-gd php-curl php-zip php-mbstring unzip curl wget certbot python3-certbot-nginx ufw fail2ban jq
+# Firewall Setup
+echo "=== Setup UFW Firewall ==="
+ufw enable
+ufw allow ssh
+ufw allow 'Nginx Full'
 
-# DETECT PHP VERSION
-PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-PHP_FPM_SERVICE="php$PHP_VER-fpm"
+# Install Nginx, PHP 8.3, dan MariaDB
+echo "=== Installing Nginx, PHP 8.3, and MariaDB ==="
+sudo apt update -y
+sudo apt install -y nginx php8.3-fpm php8.3-common php8.3-dom php8.3-intl php8.3-mysql php8.3-xml php8.3-xmlrpc php8.3-curl php8.3-gd php8.3-imagick php8.3-cli php8.3-dev php8.3-imap php8.3-mbstring php8.3-soap php8.3-zip php8.3-bcmath mariadb-server zip curl software-properties-common apt-transport-https
 
-# START & ENABLE SERVICES SAFELY
-for svc in mysql nginx $PHP_FPM_SERVICE; do
-    if systemctl list-unit-files | grep -q "^$svc"; then
-        systemctl enable $svc
-        systemctl start $svc
-    else
-        echo "Service $svc tidak ditemukan, lewati..."
-    fi
-done
+# Secure MariaDB Installation
+echo "=== Secure MariaDB Installation ==="
+sudo mysql_secure_installation
 
-# FIX MYSQL IF NOT ACTIVE
-if ! systemctl is-active --quiet mysql; then
-    echo "MySQL belum aktif, coba restart..."
-    mkdir -p /var/run/mysqld
-    chown mysql:mysql /var/run/mysqld
-    systemctl restart mysql
-    sleep 5
-    if ! systemctl is-active --quiet mysql; then
-        echo "MySQL gagal dijalankan. Periksa log dengan:"
-        echo "  sudo journalctl -xeu mysql.service"
-        exit 1
-    fi
-fi
-
-# WP-CLI
-curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-chmod +x wp-cli.phar
-mv wp-cli.phar /usr/local/bin/wp
-
-# DOWNLOAD WORDPRESS
-mkdir -p $ROOT_DIR
-wget -q https://wordpress.org/latest.zip -O /tmp/latest.zip
-unzip -oq /tmp/latest.zip -d /tmp/wordpress
-rsync -a /tmp/wordpress/ $ROOT_DIR/
-rm -rf /tmp/latest.zip /tmp/wordpress
-
-chown -R www-data:www-data $ROOT_DIR
-find $ROOT_DIR -type d -exec chmod 755 {} \;
-find $ROOT_DIR -type f -exec chmod 644 {} \;
-
-# DATABASE
-mysql -u root -p"$DB_ROOT_PASS" <<EOF
-CREATE DATABASE IF NOT EXISTS $DB_USER;
+# Membuat Database dan User
+echo "=== Creating MySQL Database and User ==="
+sudo mysql -u root -p$DB_PASS <<EOF
+CREATE DATABASE IF NOT EXISTS $DB_NAME;
 CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
-GRANT ALL PRIVILEGES ON $DB_USER.* TO '$DB_USER'@'localhost';
+GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
-# NGINX GLOBAL LIMIT
-if ! grep -q "limit_req_zone" /etc/nginx/conf.d/limit.conf 2>/dev/null; then
-    echo 'limit_req_zone $binary_remote_addr zone=mylimit:10m rate=20r/s;' > /etc/nginx/conf.d/limit.conf
-fi
-mkdir -p /etc/nginx/cache
+# Install WordPress
+echo "=== Installing WordPress ==="
+mkdir -p $ROOT_DIR
+cd $ROOT_DIR
+wget https://wordpress.org/latest.zip
+unzip latest.zip
+rm -f latest.zip
 
-# NGINX SITE CONFIG
+# Konfigurasi Nginx untuk WordPress
+echo "=== Configuring Nginx for WordPress ==="
 NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
 cat > $NGINX_CONF <<EOL
 server {
     listen 80;
-    server_name $DOMAIN www.$DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
+    listen [::]:80;
+    server_name www.$DOMAIN $DOMAIN;
+    root $ROOT_DIR;
+    index index.php index.html index.htm;
 
+    error_log /var/log/nginx/$DOMAIN.error;
+    access_log /var/log/nginx/$DOMAIN.access;
+
+    location / {
+        limit_req zone=mylimit burst=20 nodelay;
+        limit_conn addr 10;
+        try_files \$uri \$uri/ /index.php?\$args;
+
+        # START Nginx Rewrites for Rank Math Sitemaps
+        rewrite ^/sitemap_index\.xml$ /index.php?sitemap=1 last;
+        rewrite ^/([^/]+?)-sitemap([0-9]+)?.xml$ /index.php?sitemap=\$1&sitemap_n=\$2 last;
+        # END Nginx Rewrites for Rank Math Sitemaps
+    }
+
+    location ~ ^/wp-json/ {
+        rewrite ^/wp-json/(.*?)\$ /?rest_route=/$1 last;
+    }
+
+    location ~* /wp-sitemap.*\.xml {
+        try_files \$uri \$uri/ /index.php\$is_args\$args;
+    }
+
+    error_page 404 /404.html;
+    error_page 500 502 503 504 /50x.html;
+
+    client_max_body_size 20M;
+
+    location = /50x.html {
+        root /usr/share/nginx/html;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+        include snippets/fastcgi-php.conf;
+        fastcgi_buffers 1024 4k;
+        fastcgi_buffer_size 128k;
+    }
+
+    # Enable gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1000;
+    gzip_comp_level 5;
+    gzip_types application/json text/css application/x-javascript application/javascript image/svg+xml;
+    gzip_proxied any;
+
+    # Cache images, css, js, etc for 1 year
+    location ~* \.(jpg|jpeg|gif|png|webp|svg|woff|woff2|ttf|css|js|ico|xml)\$ {
+        access_log off;
+        log_not_found off;
+        expires 360d;
+    }
+
+    # Disable access to hidden files
+    location ~ /\.ht {
+        access_log off;
+        log_not_found off;
+        deny all;
+    }
+}
+EOL
+
+# Enable Nginx Configuration
+ln -s /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+sudo systemctl restart nginx
+
+# SSL Setup (Optional, Sertifikat SSL dapat ditambahkan jika diperlukan)
+echo "=== Setting Up SSL ==="
+mkdir -p $SSL_DIR
+# Sertifikat SSL dapat di-generate menggunakan Let's Encrypt atau sertifikat lainnya.
+# Sertifikat bisa ditambahkan secara manual di /etc/ssl/abgdiviral.wiki/cert.pem dan key.pem.
+
+# Nginx SSL Configuration
+cat > /etc/nginx/sites-available/$DOMAIN <<EOL
 server {
     listen 443 ssl http2;
-    server_name $DOMAIN;
+    listen [::]:443 ssl http2;
+    server_name www.$DOMAIN $DOMAIN;
+
+    ssl_certificate /etc/ssl/$DOMAIN/cert.pem;
+    ssl_certificate_key /etc/ssl/$DOMAIN/key.pem;
 
     root $ROOT_DIR;
     index index.php index.html index.htm;
 
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    limit_req zone=mylimit burst=80;
-    limit_conn addr 40;
-
-    fastcgi_cache_path /etc/nginx/cache levels=1:2 keys_zone=wordpress:100m inactive=60m;
-    fastcgi_cache_key "\$scheme\$host\$request_uri";
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$args;
-        fastcgi_cache wordpress;
-        fastcgi_cache_valid 200 60m;
-        fastcgi_cache_use_stale error timeout invalid_header updating http_500;
-        add_header X-FastCGI-Cache \$upstream_cache_status;
-    }
-
-    location ~ \.php\$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php$PHP_VER-fpm.sock;
-    }
-
-    location ~* \.(jpg|jpeg|png|webp|svg|css|js|ico|woff|woff2)\$ {
-        expires 360d;
-        access_log off;
-        add_header Cache-Control "public";
-    }
-
-    location ~ /\. { deny all; }
+    # Same configurations as the non-SSL server block above
 }
 EOL
 
-ln -sf $NGINX_CONF /etc/nginx/sites-enabled/$DOMAIN
+# Enable SSL site configuration
+sudo ln -s /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+sudo systemctl restart nginx
 
-# TEST NGINX CONFIGURATION
-nginx -t || { echo "NGINX ERROR!"; exit 1; }
+# Set Permissions untuk WordPress
+echo "=== Setting Permissions for WordPress ==="
+sudo chown -R www-data:www-data $ROOT_DIR
+chmod 755 $ROOT_DIR/wp-content
 
-# RELOAD NGINX
-systemctl reload nginx
+# Install WP-CLI
+echo "=== Installing WP-CLI ==="
+curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+chmod +x wp-cli.phar
+mv wp-cli.phar /usr/local/bin/wp
 
-# SSL
-certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m admin@$DOMAIN
+# Konfigurasi WordPress
+echo "=== Configuring WordPress ==="
+sudo -u www-data wp core config --dbname=$DB_NAME --dbuser=$DB_USER --dbpass=$DB_PASS --path=$ROOT_DIR --skip-check
 
-# WP CONFIG & INSTALL
-sudo -u www-data wp config create \
-    --path=$ROOT_DIR \
-    --dbname=$DB_USER \
-    --dbuser=$DB_USER \
-    --dbpass="$DB_PASS" \
-    --dbhost=localhost \
-    --skip-check
+# Install dan Konfigurasi WordPress
+echo "=== Installing WordPress ==="
+sudo -u www-data wp core install --url="https://$DOMAIN" --title="Abgdiviral Wiki" --admin_user="admin" --admin_password="admin_password" --admin_email="admin@$DOMAIN" --path=$ROOT_DIR
 
-sudo -u www-data wp core install \
-    --path=$ROOT_DIR \
-    --url="https://$DOMAIN" \
-    --title="$DOMAIN" \
-    --admin_user="admin" \
-    --admin_password="$(openssl rand -base64 12)" \
-    --admin_email="admin@$DOMAIN"
-
-# INSTALL RANKMATH
+# Install RankMath SEO Plugin
+echo "=== Installing RankMath SEO Plugin ==="
 sudo -u www-data wp plugin install rank-math --activate --path=$ROOT_DIR
 
-# FASTCGI AUTO PURGE + RANKMATH SITEMAP
+# FastCGI Auto Purge Plugin for RankMath
+echo "=== Setting Up FastCGI Auto Purge for RankMath ==="
 WP_HOOK_FILE="$ROOT_DIR/wp-content/plugins/fastcgi-pro-auto-purge.php"
 cat > $WP_HOOK_FILE <<EOL
 <?php
@@ -170,6 +187,7 @@ Description: Auto purge FastCGI cache on plugin/theme/content update and RankMat
 */
 add_action('save_post', function(\$post_id){
     exec("rm -rf /etc/nginx/cache/*");
+    // Cloudflare purge
     if (file_exists('/etc/cloudflare.env')) {
         \$token = trim(file_get_contents('/etc/cloudflare.env'));
         exec("curl -X POST 'https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache' -H 'Authorization: Bearer \$token' -H 'Content-Type: application/json' --data '{\"purge_everything\":true}'");
@@ -181,32 +199,29 @@ add_action('upgrader_process_complete', function() {
 EOL
 chown www-data:www-data $WP_HOOK_FILE
 
-# Save Cloudflare token
-if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
-    echo "$CF_API_TOKEN" > /etc/cloudflare.env
-    chmod 600 /etc/cloudflare.env
-fi
+# Final Nginx Configuration untuk Pembatasan
+echo "=== Configuring Nginx Global Limits ==="
+cat > /etc/nginx/nginx.conf <<EOL
+limit_req_zone \$binary_remote_addr zone=mylimit:10m rate=10r/s;
+limit_conn_zone \$binary_remote_addr zone=addr:10m;
+client_body_timeout   10s;
+client_header_timeout 10s;
+keepalive_timeout     10s;
+send_timeout          10s;
+EOL
 
-# Cron update
+# Reload Nginx
+echo "=== Reloading Nginx ==="
+sudo nginx -t
+sudo systemctl restart nginx
+
+# Cron Update WordPress
+echo "=== Setting Up Automatic WordPress Update ==="
 (crontab -l 2>/dev/null; echo "0 3 * * * wp core update --path=$ROOT_DIR && wp plugin update --all --path=$ROOT_DIR") | crontab -
 
-# Firewall & Fail2Ban
-ufw allow OpenSSH
-ufw allow 'Nginx Full'
-ufw --force enable
-systemctl enable fail2ban
-systemctl start fail2ban
-
-echo "==== INSTALL PRO BERHASIL ===="
-echo "Domain       : $DOMAIN"
-echo "Database     : $DB_USER"
-echo "DB Password  : $DB_PASS"
-echo "Root Dir     : $ROOT_DIR"
-echo "Admin User   : admin"
-echo "Admin Pass   : (random, lihat WP log)"
-echo "RankMath SEO plugin activated"
-echo "FastCGI Cache + Auto Purge siap pakai"
-echo "Cloudflare auto-purge: $USE_CF"
-echo "Firewall + Fail2Ban aktif"
-echo "Cron Update aktif"
-echo "========================================="
+echo "=== Installation Complete ==="
+echo "WordPress has been successfully installed!"
+echo "Domain: $DOMAIN"
+echo "Database: $DB_NAME"
+echo "Admin User: admin"
+echo "Admin Password: admin_password"
