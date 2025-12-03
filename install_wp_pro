@@ -1,0 +1,193 @@
+#!/bin/bash
+
+############################################
+# WORDPRESS PRO ULTIMATE AUTO-INSTALL
+# WP + FASTCGI + RANKMATH + AUTO PURGE + CLOUDFLARE
+############################################
+
+# INPUT
+read -p "Masukkan nama domain (contoh: example.com): " DOMAIN
+read -s -p "Masukkan password root MySQL: " DB_ROOT_PASS
+echo
+read -p "Apakah mau setup Cloudflare auto-purge cache? (y/n): " USE_CF
+if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
+    read -p "Masukkan Cloudflare API Token: " CF_API_TOKEN
+    read -p "Masukkan Cloudflare Zone ID: " CF_ZONE_ID
+fi
+
+ROOT_DIR="/var/www/$DOMAIN"
+DB_USER=$(echo $DOMAIN | sed 's/[^a-zA-Z0-9]//g')
+DB_PASS=$(openssl rand -base64 16)
+
+echo "=== UPDATE SERVER & DEPENDENCIES ==="
+apt update -y
+apt install -y nginx mysql-server php php-fpm php-mysql php-xml php-gd php-curl php-zip php-mbstring unzip curl wget certbot python3-certbot-nginx ufw fail2ban jq
+
+# START SERVICES
+systemctl enable mysql nginx php*-fpm
+systemctl start mysql nginx php*-fpm
+
+# FIX MYSQL IF NOT ACTIVE
+if ! systemctl is-active --quiet mysql; then
+    mkdir -p /var/run/mysqld
+    chown mysql:mysql /var/run/mysqld
+    systemctl restart mysql
+fi
+
+# WP-CLI
+curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+chmod +x wp-cli.phar
+mv wp-cli.phar /usr/local/bin/wp
+
+# DOWNLOAD WORDPRESS
+mkdir -p $ROOT_DIR
+wget -q https://wordpress.org/latest.zip -O /tmp/latest.zip
+unzip -oq /tmp/latest.zip -d /tmp/
+mv /tmp/wordpress/* $ROOT_DIR/
+rm -rf /tmp/latest.zip /tmp/wordpress
+
+chown -R www-data:www-data $ROOT_DIR
+find $ROOT_DIR -type d -exec chmod 755 {} \;
+find $ROOT_DIR -type f -exec chmod 644 {} \;
+
+# DATABASE
+mysql -u root -p"$DB_ROOT_PASS" <<EOF
+CREATE DATABASE IF NOT EXISTS $DB_USER;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON $DB_USER.* TO '$DB_USER'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+# NGINX CONFIG GLOBAL
+if [ ! -f /etc/nginx/conf.d/limit.conf ]; then
+    echo 'limit_req_zone $binary_remote_addr zone=mylimit:10m rate=20r/s;' > /etc/nginx/conf.d/limit.conf
+fi
+mkdir -p /etc/nginx/cache
+
+# NGINX SITE CONFIG
+NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
+cat > $NGINX_CONF <<EOL
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    root $ROOT_DIR;
+    index index.php index.html index.htm;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+
+    limit_req zone=mylimit burst=80;
+    limit_conn addr 40;
+
+    fastcgi_cache_path /etc/nginx/cache levels=1:2 keys_zone=wordpress:100m inactive=60m;
+    fastcgi_cache_key "\$scheme\$host\$request_uri";
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+        fastcgi_cache wordpress;
+        fastcgi_cache_valid 200 60m;
+        fastcgi_cache_use_stale error timeout invalid_header updating http_500;
+        add_header X-FastCGI-Cache \$upstream_cache_status;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+    }
+
+    location ~* \.(jpg|jpeg|png|webp|svg|css|js|ico|woff|woff2)\$ {
+        expires 360d;
+        access_log off;
+        add_header Cache-Control "public";
+    }
+
+    location ~ /\. { deny all; }
+}
+EOL
+
+ln -sf $NGINX_CONF /etc/nginx/sites-enabled/$DOMAIN
+
+nginx -t || { echo "NGINX ERROR!"; exit 1; }
+systemctl reload nginx
+
+# SSL
+certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m admin@$DOMAIN
+
+# WP CONFIG & INSTALL
+sudo -u www-data wp config create \
+    --path=$ROOT_DIR \
+    --dbname=$DB_USER \
+    --dbuser=$DB_USER \
+    --dbpass="$DB_PASS" \
+    --dbhost=localhost \
+    --skip-check
+
+sudo -u www-data wp core install \
+    --path=$ROOT_DIR \
+    --url="https://$DOMAIN" \
+    --title="$DOMAIN" \
+    --admin_user="admin" \
+    --admin_password="$(openssl rand -base64 12)" \
+    --admin_email="admin@$DOMAIN"
+
+# INSTALL RANKMATH
+sudo -u www-data wp plugin install rank-math --activate --path=$ROOT_DIR
+
+# FASTCGI AUTO PURGE + RANKMATH SITEMAP
+WP_HOOK_FILE="$ROOT_DIR/wp-content/plugins/fastcgi-pro-auto-purge.php"
+cat > $WP_HOOK_FILE <<EOL
+<?php
+/*
+Plugin Name: FastCGI PRO Auto Purge
+Description: Auto purge FastCGI cache on plugin/theme/content update and RankMath sitemap changes
+*/
+add_action('save_post', function(\$post_id){
+    exec("rm -rf /etc/nginx/cache/*");
+    // Cloudflare purge
+    if (file_exists('/etc/cloudflare.env')) {
+        \$token = trim(file_get_contents('/etc/cloudflare.env'));
+        exec("curl -X POST 'https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache' -H 'Authorization: Bearer \$token' -H 'Content-Type: application/json' --data '{\"purge_everything\":true}'");
+    }
+});
+add_action('upgrader_process_complete', function() {
+    exec("rm -rf /etc/nginx/cache/*");
+});
+EOL
+chown www-data:www-data $WP_HOOK_FILE
+
+# Save Cloudflare token
+if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
+    echo "$CF_API_TOKEN" > /etc/cloudflare.env
+    chmod 600 /etc/cloudflare.env
+fi
+
+# Cron update
+(crontab -l 2>/dev/null; echo "0 3 * * * wp core update --path=$ROOT_DIR && wp plugin update --all --path=$ROOT_DIR") | crontab -
+
+# Firewall & Fail2Ban
+ufw allow OpenSSH
+ufw allow 'Nginx Full'
+ufw --force enable
+systemctl enable fail2ban
+systemctl start fail2ban
+
+echo "==== INSTALL PRO BERHASIL ===="
+echo "Domain       : $DOMAIN"
+echo "Database     : $DB_USER"
+echo "DB Password  : $DB_PASS"
+echo "Root Dir     : $ROOT_DIR"
+echo "Admin User   : admin"
+echo "Admin Pass   : (random, lihat WP log)"
+echo "RankMath SEO plugin activated"
+echo "FastCGI Cache + Auto Purge siap pakai"
+echo "Cloudflare auto-purge: $USE_CF"
+echo "Firewall + Fail2Ban aktif"
+echo "Cron Update aktif"
+echo "========================================="
