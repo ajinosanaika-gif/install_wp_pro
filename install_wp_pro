@@ -23,9 +23,13 @@ echo "=== UPDATE SERVER & DEPENDENCIES ==="
 apt update -y
 apt install -y nginx mysql-server php php-fpm php-mysql php-xml php-gd php-curl php-zip php-mbstring unzip curl wget certbot python3-certbot-nginx ufw fail2ban jq
 
+# DETECT PHP VERSION
+PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+PHP_FPM_SERVICE="php$PHP_VER-fpm"
+
 # START SERVICES
-systemctl enable mysql nginx php*-fpm
-systemctl start mysql nginx php*-fpm
+systemctl enable mysql nginx $PHP_FPM_SERVICE
+systemctl start mysql nginx $PHP_FPM_SERVICE
 
 # FIX MYSQL IF NOT ACTIVE
 if ! systemctl is-active --quiet mysql; then
@@ -42,9 +46,8 @@ mv wp-cli.phar /usr/local/bin/wp
 # DOWNLOAD WORDPRESS
 mkdir -p $ROOT_DIR
 wget -q https://wordpress.org/latest.zip -O /tmp/latest.zip
-unzip -oq /tmp/latest.zip -d /tmp/
-mv /tmp/wordpress/* $ROOT_DIR/
-rm -rf /tmp/latest.zip /tmp/wordpress
+unzip -oq /tmp/latest.zip -d $ROOT_DIR
+rm -rf /tmp/latest.zip
 
 chown -R www-data:www-data $ROOT_DIR
 find $ROOT_DIR -type d -exec chmod 755 {} \;
@@ -58,8 +61,8 @@ GRANT ALL PRIVILEGES ON $DB_USER.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
-# NGINX CONFIG GLOBAL
-if [ ! -f /etc/nginx/conf.d/limit.conf ]; then
+# NGINX GLOBAL LIMIT
+if ! grep -q "limit_req_zone" /etc/nginx/conf.d/limit.conf 2>/dev/null; then
     echo 'limit_req_zone $binary_remote_addr zone=mylimit:10m rate=20r/s;' > /etc/nginx/conf.d/limit.conf
 fi
 mkdir -p /etc/nginx/cache
@@ -99,7 +102,7 @@ server {
 
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php-fpm.sock;
+        fastcgi_pass unix:/run/php/php$PHP_VER-fpm.sock;
     }
 
     location ~* \.(jpg|jpeg|png|webp|svg|css|js|ico|woff|woff2)\$ {
@@ -150,7 +153,6 @@ Description: Auto purge FastCGI cache on plugin/theme/content update and RankMat
 */
 add_action('save_post', function(\$post_id){
     exec("rm -rf /etc/nginx/cache/*");
-    // Cloudflare purge
     if (file_exists('/etc/cloudflare.env')) {
         \$token = trim(file_get_contents('/etc/cloudflare.env'));
         exec("curl -X POST 'https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache' -H 'Authorization: Bearer \$token' -H 'Content-Type: application/json' --data '{\"purge_everything\":true}'");
