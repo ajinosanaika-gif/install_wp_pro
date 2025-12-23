@@ -111,27 +111,16 @@ read dbuser
 echo -e "\n\e[1;34mEnter your database password:\e[0m"
 read -s dbpass
 
-# Create database and user (improved to check if exists)
+# Create database and user
 echo "Setting up database..."
-
 sudo mariadb <<EOF &>/dev/null
--- Create database only if not exists
-CREATE DATABASE IF NOT EXISTS ${dbname};
-
--- Create user only if not exists
-CREATE USER IF NOT EXISTS ${dbuser}@localhost IDENTIFIED BY '${dbpass}';
-
--- Grant all privileges to the user
+CREATE DATABASE ${dbname};
+CREATE USER ${dbuser}@localhost IDENTIFIED BY '${dbpass}';
 GRANT ALL PRIVILEGES ON ${dbname}.* TO ${dbuser}@localhost;
-
--- Set root password if not already set
-ALTER USER 'root'@'localhost' IDENTIFIED BY '${dbpass}';
-
--- Refresh privileges
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${dbpass}';  
 FLUSH PRIVILEGES;
 EXIT;
 EOF
-
 
 # Download and set up WordPress
 echo "Setting up WordPress..."
