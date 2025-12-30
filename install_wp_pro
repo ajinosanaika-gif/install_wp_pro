@@ -133,36 +133,67 @@ rm -f wordpress.zip &>/dev/null
 # Configure Nginx for the domain
 echo "Configuring Nginx for ${domain}..."
 sudo tee /etc/nginx/sites-available/${domain} &>/dev/null <<EOF
+# ==================================================
+# 1) HTTP server block → redirect ke HTTPS
+# ==================================================
 server {
     listen 80;
     listen [::]:80;
-  
+    server_name www.domainku.com domainku.com;
+
+    # Redirect semua HTTP ke HTTPS
+    return 301 https://domainku.com$request_uri;
+}
+
+# ==================================================
+# 2) HTTPS server block → WordPress
+# ==================================================
+server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    ssl_certificate         /etc/ssl/${domain}/cert.pem;
-    ssl_certificate_key     /etc/ssl/${domain}/key.pem;
+    server_name www.domainku.com domainku.com;
 
-    server_name www.${domain} ${domain};
-    root /var/www/${domain}/wordpress/;
-    index index.php index.html index.htm index.nginx-debian.html;
+    # SSL configuration
+    ssl_certificate         /etc/ssl/domainku.com/cert.pem;
+    ssl_certificate_key     /etc/ssl/domainku.com/key.pem;
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_ciphers             'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES128-GCM-SHA256';
+    ssl_prefer_server_ciphers on;
+    ssl_dhparam /etc/ssl/certs/dhparam.pem;  # Pastikan file ini ada
 
-    error_log /var/log/nginx/wordpress.error;
-    access_log /var/log/nginx/wordpress.access;
+    # Root & index
+    root /var/www/domainku.com/wordpress;
+    index index.php index.html index.htm;
 
+    # Logs
+    error_log /var/log/nginx/wordpress-ssl.error;
+    access_log /var/log/nginx/wordpress-ssl.access;
+
+    # ==================================================
+    # Main WordPress location
+    # ==================================================
     location / {
         limit_req zone=mylimit burst=20 nodelay;
         limit_conn addr 10;
-        try_files \$uri \$uri/ /index.php;
+        try_files $uri $uri/ /index.php?$args;
+
+        # START Rank Math sitemap rewrites
+        rewrite ^/sitemap_index\.xml$ /index.php?sitemap=1 last;
+        rewrite ^/([^/]+?)-sitemap([0-9]+)?.xml$ /index.php?sitemap=$1&sitemap_n=$2 last;
+        # END Rank Math rewrites
     }
 
+    # WordPress REST API
     location ~ ^/wp-json/ {
-        rewrite ^/wp-json/(.*?)$ /?rest_route=/\$1 last;
+        rewrite ^/wp-json/(.*?)$ /?rest_route=/$1 last;
     }
 
+    # WordPress sitemaps
     location ~* /wp-sitemap.*\.xml {
-        try_files \$uri \$uri/ /index.php\$is_args\$args;
+        try_files $uri $uri/ /index.php$is_args$args;
     }
 
+    # Error pages
     error_page 404 /404.html;
     error_page 500 502 503 504 /50x.html;
 
@@ -172,15 +203,16 @@ server {
         root /usr/share/nginx/html;
     }
 
-    location ~ \\.php\$ {
-        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        include fastcgi_params;
+    # PHP-FPM
+    location ~ \.php$ {
         include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.1-fpm.sock;  # Sesuaikan versi PHP
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         fastcgi_buffers 1024 4k;
         fastcgi_buffer_size 128k;
     }
 
+    # Gzip compression
     gzip on;
     gzip_vary on;
     gzip_min_length 1000;
@@ -188,13 +220,15 @@ server {
     gzip_types application/json text/css application/x-javascript application/javascript image/svg+xml;
     gzip_proxied any;
 
-    location ~* \\\.(jpg|jpeg|gif|png|webp|svg|woff|woff2|ttf|css|js|ico|xml)\$ {
-        access_log off;
-        log_not_found off;
-        expires 360d;
+    # Cache static files
+    location ~* \.(jpg|jpeg|gif|png|webp|svg|woff|woff2|ttf|css|js|ico|xml)$ {
+        access_log        off;
+        log_not_found     off;
+        expires           360d;
     }
 
-    location ~ /\\.ht {
+    # Disable access to hidden files (.htaccess etc)
+    location ~ /\. {
         access_log off;
         log_not_found off;
         deny all;
